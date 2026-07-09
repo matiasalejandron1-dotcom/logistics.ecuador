@@ -1,5 +1,5 @@
 import io
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 import streamlit as st
@@ -169,13 +169,6 @@ selected_origins = st.sidebar.multiselect("Origen (CUTTINGS FROM)", origins)
 tipos_disponibles = [TIPO_DIRECTO, TIPO_ENRAIZA, TIPO_REVISAR]
 selected_tipos = st.sidebar.multiselect("Tipo de proceso", tipos_disponibles)
 
-all_weeks = sorted(
-    set(df["IMPORT WEEK (norm)"].dropna()) | set(df["DELIVERY WEEK (norm)"].dropna()),
-    key=lambda w: (int(w.split("/")[1]), int(w.split("/")[0])),
-)
-week_options = ["Todas"] + all_weeks
-selected_week = st.sidebar.selectbox("Semana", week_options)
-
 filtered = df.copy()
 if selected_customers:
     filtered = filtered[filtered["CUSTOMER"].astype(str).isin(selected_customers)]
@@ -214,19 +207,85 @@ def display_table(d):
     return d[cols].rename(columns=DISPLAY_RENAME)
 
 
-def week_breakdown(d, week_str):
-    week_num, week_year = week_str.split("/")
-    week_key = (int(week_year), int(week_num))
-    week_date = week_to_date(*week_key)
+def week_key_from_date(d):
+    year, week, _ = d.isocalendar()
+    return (year, week)
 
+
+def shift_week(week_key, offset):
+    return week_key_from_date(week_to_date(*week_key) + timedelta(weeks=offset))
+
+
+def format_week_key(week_key):
+    year, week = week_key
+    return f"{week:02d}/{year}"
+
+
+def week_breakdown(d, week_key):
+    week_date = week_to_date(*week_key)
     importa = d[d["_import_parsed"] == week_key]
-    entrega = d[d["_delivery_parsed"] == week_key]
+    entrega_directa = d[(d["_delivery_parsed"] == week_key) & (d["TIPO"] == TIPO_DIRECTO)]
+    entrega_enraizado = d[(d["_delivery_parsed"] == week_key) & (d["TIPO"] == TIPO_ENRAIZA)]
     enraizando = d[
         (d["TIPO"] == TIPO_ENRAIZA)
         & d["_import_parsed"].apply(lambda p: p is not None and week_to_date(*p) <= week_date)
         & d["_delivery_parsed"].apply(lambda p: p is not None and week_date < week_to_date(*p))
     ]
-    return importa, entrega, enraizando
+    return importa, entrega_directa, entrega_enraizado, enraizando
+
+
+def render_by_origin(d):
+    origins_here = sorted({str(o) for o in d["CUTTINGS FROM"].dropna() if str(o).strip()})
+    if not origins_here:
+        st.info("No hay filas para mostrar.")
+        return
+    origin_tabs = st.tabs([f"🌍 {o}" for o in origins_here])
+    for tab, origin in zip(origin_tabs, origins_here):
+        with tab:
+            subset = d[d["CUTTINGS FROM"].astype(str) == origin]
+            st.dataframe(display_table(subset), use_container_width=True, hide_index=True)
+
+
+def render_week_view(d, week_key):
+    st.caption(f"Semana {format_week_key(week_key)}")
+    importa, entrega_directa, entrega_enraizado, enraizando = week_breakdown(d, week_key)
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("📦 Importa", int(importa["PLANTS"].sum()))
+    k2.metric("🌱 Enraizando", len(enraizando))
+    k3.metric("🚚 Entrega directa", int(entrega_directa["PLANTS"].sum()))
+    k4.metric("🌷 Entrega de enraizado", int(entrega_enraizado["PLANTS"].sum()))
+
+    combined = pd.concat([importa, entrega_directa, entrega_enraizado, enraizando])
+    origins_here = sorted({str(o) for o in combined["CUTTINGS FROM"].dropna() if str(o).strip()})
+    if not origins_here:
+        st.info("No hay datos para esta semana.")
+        return
+
+    origin_tabs = st.tabs([f"🌍 {o}" for o in origins_here])
+    for tab, origin in zip(origin_tabs, origins_here):
+        with tab:
+            o_importa = importa[importa["CUTTINGS FROM"].astype(str) == origin]
+            o_enraizando = enraizando[enraizando["CUTTINGS FROM"].astype(str) == origin]
+            o_entrega_directa = entrega_directa[entrega_directa["CUTTINGS FROM"].astype(str) == origin]
+            o_entrega_enraizado = entrega_enraizado[entrega_enraizado["CUTTINGS FROM"].astype(str) == origin]
+
+            sub_tabs = st.tabs(
+                [
+                    f"📦 Importa ({len(o_importa)})",
+                    f"🌱 Enraizando ({len(o_enraizando)})",
+                    f"🚚 Entrega directa ({len(o_entrega_directa)})",
+                    f"🌷 Entrega de enraizado ({len(o_entrega_enraizado)})",
+                ]
+            )
+            with sub_tabs[0]:
+                st.dataframe(display_table(o_importa), use_container_width=True, hide_index=True)
+            with sub_tabs[1]:
+                st.dataframe(display_table(o_enraizando), use_container_width=True, hide_index=True)
+            with sub_tabs[2]:
+                st.dataframe(display_table(o_entrega_directa), use_container_width=True, hide_index=True)
+            with sub_tabs[3]:
+                st.dataframe(display_table(o_entrega_enraizado), use_container_width=True, hide_index=True)
 
 
 kpi1, kpi2, kpi3 = st.columns(3)
@@ -234,56 +293,82 @@ kpi1.metric("Cantidad total (filtrado)", int(filtered["PLANTS"].sum()))
 kpi2.metric("Líneas", len(filtered))
 kpi3.metric("Clientes", filtered["CUSTOMER"].nunique())
 
-weeks_to_show = all_weeks if selected_week == "Todas" else [selected_week]
+today = date.today()
+current_week_key = week_key_from_date(today)
+past_week_key = shift_week(current_week_key, -1)
+plus_weeks = [shift_week(current_week_key, i) for i in (1, 2, 3)]
+horizon_end = plus_weeks[-1]
 
-summary_rows = []
-breakdown_by_week = {}
-for w in weeks_to_show:
-    importa, entrega, enraizando = week_breakdown(filtered, w)
-    breakdown_by_week[w] = (importa, entrega, enraizando)
-    summary_rows.append(
-        {
-            "SEMANA": w,
-            "CANTIDAD IMPORTADA": int(importa["PLANTS"].sum()),
-            "CANTIDAD ENTREGADA": int(entrega["PLANTS"].sum()),
-            "LOTES ENRAIZANDO": len(enraizando),
-        }
-    )
+all_week_keys = sorted(
+    {k for k in pd.concat([filtered["_import_parsed"], filtered["_delivery_parsed"]]) if k is not None}
+)
 
-st.subheader("📊 Resumen por semana")
-st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+tab_overview, tab_history, tab_past, tab_current, tab_p1, tab_p2, tab_p3, tab_future = st.tabs(
+    [
+        "📊 Overview",
+        "🕰️ History",
+        "⏮️ Past Week",
+        "📍 Current Week",
+        "➡️ Week +1",
+        "➡️ Week +2",
+        "➡️ Week +3",
+        "🔮 Future Shipments",
+    ]
+)
 
-st.subheader("📅 Detalle por semana (origen, producto y cantidad)")
-download_parts = []
-for w in weeks_to_show:
-    importa, entrega, enraizando = breakdown_by_week[w]
-    download_parts.extend([importa, entrega, enraizando])
-    with st.expander(f"Semana {w}", expanded=(len(weeks_to_show) == 1)):
-        tab_import, tab_entrega, tab_enraiza = st.tabs(
-            [
-                f"📦 Importa ({len(importa)})",
-                f"🚚 Entrega ({len(entrega)})",
-                f"🌱 Enraizando ({len(enraizando)})",
-            ]
+with tab_overview:
+    st.subheader("📊 Resumen por semana")
+    summary_rows = []
+    for w in all_week_keys:
+        importa, entrega_directa, entrega_enraizado, enraizando = week_breakdown(filtered, w)
+        summary_rows.append(
+            {
+                "SEMANA": format_week_key(w),
+                "CANTIDAD IMPORTADA": int(importa["PLANTS"].sum()),
+                "CANTIDAD ENTREGA DIRECTA": int(entrega_directa["PLANTS"].sum()),
+                "CANTIDAD ENTREGA ENRAIZADO": int(entrega_enraizado["PLANTS"].sum()),
+                "LOTES ENRAIZANDO": len(enraizando),
+            }
         )
-        with tab_import:
-            st.dataframe(display_table(importa), use_container_width=True, hide_index=True)
-        with tab_entrega:
-            st.dataframe(display_table(entrega), use_container_width=True, hide_index=True)
-        with tab_enraiza:
-            st.dataframe(display_table(enraizando), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
 
-table_for_download = pd.concat(download_parts).drop_duplicates() if download_parts else filtered.iloc[0:0]
+with tab_history:
+    history_df = filtered[
+        filtered["_delivery_parsed"].apply(lambda p: p is not None and p < past_week_key)
+    ]
+    st.caption(f"Entregas completadas antes de la semana {format_week_key(past_week_key)}")
+    render_by_origin(history_df)
+
+with tab_past:
+    render_week_view(filtered, past_week_key)
+
+with tab_current:
+    render_week_view(filtered, current_week_key)
+
+with tab_p1:
+    render_week_view(filtered, plus_weeks[0])
+
+with tab_p2:
+    render_week_view(filtered, plus_weeks[1])
+
+with tab_p3:
+    render_week_view(filtered, plus_weeks[2])
+
+with tab_future:
+    future_df = filtered[
+        filtered["_import_parsed"].apply(lambda p: p is not None and p > horizon_end)
+    ]
+    st.caption(f"Importaciones programadas después de la semana {format_week_key(horizon_end)}")
+    render_by_origin(future_df)
 
 revisar = filtered[filtered["TIPO"] == TIPO_REVISAR]
 if not revisar.empty:
     st.subheader("⚠️ Filas para revisar en el Excel original")
     st.dataframe(display_table(revisar), use_container_width=True, hide_index=True)
-    table_for_download = pd.concat([table_for_download, revisar]).drop_duplicates()
 
 st.download_button(
     "⬇️ Descargar resultado filtrado (Excel)",
-    data=to_excel_bytes(table_for_download),
+    data=to_excel_bytes(filtered),
     file_name="control_importaciones_entregas.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
